@@ -87,7 +87,10 @@ OF SUCH DAMAGE.
 #include <dlfcn.h>
 #include <assert.h>
 #include <limits.h>		// INT_MAX
-
+#if USE_MC
+#include <pwd.h> // getpwnam()
+#include "push_user.h"
+#endif
 
 // ===========================================================================
 // DEFAULT
@@ -715,6 +718,8 @@ int   mc_config(struct DAL*     dal,
 
    MC_Config* config = malloc(sizeof(MC_Config));
    config->degraded_log_fd = -1;
+   const char *default_admin_name = "mcadmin";
+   strncpy(config->admin_username, default_admin_name, 256);
 
    int i;
    for(i = 0; i < opt_count; i++) {
@@ -745,6 +750,9 @@ int   mc_config(struct DAL*     dal,
          config->degraded_log_fd = open_degraded_object_log(
             opts[i]->val.value.str);
       }
+      else if(!strcmp(opts[i]->key, "admin_user")) {
+         strncpy(config->admin_username, opts[i]->val.value.str, 256);
+      }
       else {
          LOG(LOG_ERR, "Unrecognized MC DAL config option: %s\n",
              opts[i]->key);
@@ -752,6 +760,15 @@ int   mc_config(struct DAL*     dal,
          return -1;
       }
    }
+
+   struct passwd *passwd = getpwnam(config->admin_username);
+   if(passwd == NULL) {
+      LOG(LOG_ERR, "could not fund user %s. Failed to configure MC DAL.\n",
+          config->admin_username);
+      return -1;
+   }
+   config->admin_uid = passwd->pw_uid;
+   config->admin_gid = passwd->pw_gid;
 
    if(config->degraded_log_fd == -1) {
       LOG(LOG_ERR, "failed to open degraded log file.\n");
@@ -889,30 +906,45 @@ int mc_update_path(DAL_Context* ctx) {
 }
 
 // Actually open an object, don't just defer it and say we did it.
-int mc_do_open(DAL_Context* ctx) {
+int mc_do_open(DAL_Context* mc_ctx) {
    ENTRY();
 
-   ObjectStream* os            = MC_OS(ctx);
-   char*         path_template = MC_CONTEXT(ctx)->path_template;
+   ObjectStream* os            = MC_OS(mc_ctx);
+   char*         path_template = MC_CONTEXT(mc_ctx)->path_template;
 
-   unsigned int n = MC_CONFIG(ctx)->n;
-   unsigned int e = MC_CONFIG(ctx)->e;
+   unsigned int n = MC_CONFIG(mc_ctx)->n;
+   unsigned int e = MC_CONFIG(mc_ctx)->e;
 
    // QUESTION: Should we test os->flags & OSF_OPEN here? It would be
    // an error to call this except after mc_open(), but... this should
    // only be used internally anyway, so we can pretty much guarantee
    // that won't happen.
-   
+
    int mode = (os->flags & OSF_WRITING) ? NE_WRONLY : NE_RDONLY;
-   MC_HANDLE(ctx) = ne_open(path_template, mode,
-                            MC_CONTEXT(ctx)->start_block, n, e);
-   if(! MC_HANDLE(ctx)) {
+   MC_HANDLE(mc_ctx) = ne_open(path_template, mode,
+                               MC_CONTEXT(mc_ctx)->start_block, n, e);
+   if(! MC_HANDLE(mc_ctx)) {
       LOG(LOG_ERR, "Failed to open MC Handle %s\n", path_template);
       return -1;
    }
 
+   // become root again so we can chown.
+   PUSH_USER(0, 0, 0);
+
+   int i;
+   for(i = 0; i < n+e; i++) {
+      char path[MC_MAX_PATH_LEN];
+      sprintf(path, path_template, i);
+      if(chown(path,
+               MC_CONFIG(mc_ctx)->admin_uid,
+               MC_CONFIG(mc_ctx)->admin_gid) == -1) {
+         LOG(LOG_ERR, "Failed to chown object part: %s\n", strerror(errno));
+      }
+   }
+
+   POP_USER();
    // open is no longer defered.
-   ctx->flags &= ~MCF_DEFERED_OPEN;
+   mc_ctx->flags &= ~MCF_DEFERED_OPEN;
    
    EXIT();
    return 0;
@@ -1334,7 +1366,6 @@ DAL* dynamic_DAL(const char* name) {
 DAL* get_DAL(const char* name) {
    static int needs_init = 1;
    if (needs_init) {
-
       // one-time initialization of dal_list
       assert(! install_DAL(&obj_dal)   );
       assert(! install_DAL(&nop_dal)   );

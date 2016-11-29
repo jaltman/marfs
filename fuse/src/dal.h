@@ -124,6 +124,9 @@ extern "C" {
 // know how many pods and capacity units are in each repo when
 // generating statistics about failures.
 typedef struct mc_config {
+   char         admin_username[256]; // should be large enough
+   uid_t        admin_uid;
+   gid_t        admin_gid;
    unsigned int n;
    unsigned int e;
    unsigned int num_pods;
